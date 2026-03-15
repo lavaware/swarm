@@ -1,8 +1,7 @@
-import type { HeadersInit, ProxyAgent, RequestInit } from "undici";
+import type { HeadersInit, RequestInit } from "undici";
 import type { ProxyConfig, ProxyProvider } from "./provider";
 import process from "node:process";
-import { fetch } from "undici";
-import { HttpsProxyAgent } from "./agent";
+import { fetch, ProxyAgent } from "undici";
 import { Timer } from "./timer";
 import { sleep } from "./util";
 import "colors";
@@ -10,12 +9,12 @@ import "colors";
 export class Proxy {
   host: string;
   port: number;
-  agent: HttpsProxyAgent<string>;
+  agent: ProxyAgent;
   constructor(config: ProxyConfig) {
     this.host = config.host;
     this.port = config.port;
-    const url = `http://${config.username}:${config.password}@${config.host}:${config.port}`;
-    const agent = new HttpsProxyAgent(url);
+    const uri = `http://${config.username}:${config.password}@${config.host}:${config.port}`;
+    const agent = new ProxyAgent(uri);
     this.agent = agent;
   }
 }
@@ -30,6 +29,7 @@ interface SwarmOpts {
   pingIntervalMs?: number;
   pingTimeoutMs?: number;
   proxyTimeoutMs?: number;
+  shutdownBehavior?: "terminate";
 }
 
 interface SwarmConfig {
@@ -40,6 +40,7 @@ interface SwarmConfig {
   pingIntervalMs: number;
   pingTimeoutMs: number;
   proxyTimeoutMs: number;
+  shutdownBehavior: "terminate" | null;
 }
 
 class ProxySwarm {
@@ -70,9 +71,10 @@ class ProxySwarm {
   constructor({ proxies, providers, ...opts }: SwarmOpts) {
     this.config = {
       waitForProxiesReady: true,
-      pingIntervalMs: 2000,
-      pingTimeoutMs: 5000,
+      pingIntervalMs: 5000,
+      pingTimeoutMs: 15000,
       proxyTimeoutMs: 15000,
+      shutdownBehavior: null,
       ...opts,
     };
     if (!proxies?.length && !providers?.length) {
@@ -122,7 +124,7 @@ class ProxySwarm {
   }
 
   private log(message: string, ...args: unknown[]): void {
-    console.log(`[ProxySwarm] ${message}`, ...args);
+    console.log(`${"[ProxySwarm]".yellow} ${message}`, ...args);
   }
 
   private error(message: string, ...args: unknown[]): void {
@@ -145,11 +147,8 @@ class ProxySwarm {
           try {
             const controller = new AbortController();
             const timeout = setTimeout(() => controller.abort(), this.config.pingTimeoutMs);
-
             await fetch(`http://${proxy.host}:${proxy.port}/`, { signal: controller.signal });
-
             clearTimeout(timeout);
-            this.log(`${proxy.host} is ready`);
             this.runningProxies.add(proxy.host);
           }
           catch {
@@ -160,7 +159,7 @@ class ProxySwarm {
       const endTime = Date.now();
       const elapsed = endTime - startTime;
       if (elapsed < this.config.pingIntervalMs) {
-        await new Promise(resolve => setTimeout(resolve, this.config.pingIntervalMs - elapsed));
+        await sleep(this.config.pingIntervalMs - elapsed);
       }
     }
   }
@@ -180,6 +179,9 @@ class ProxySwarm {
       return this.run(urls, handler, errorHandler);
     }
 
+    this.log(`All proxies ready`);
+    this.log(`Running ${urls.length} URLs`);
+
     this.urlQueue.push(...urls);
 
     const timer = new Timer({
@@ -191,12 +193,8 @@ class ProxySwarm {
     });
 
     const workers = this.proxies.map(proxy => this.runWorker(proxy, handler, errorHandler, timer));
-
-    this.log("workers", workers);
-
     await Promise.all(workers);
-
-    this.log("all workers done");
+    this.log("All workers done");
   }
 
   async runWorker(
@@ -217,7 +215,7 @@ class ProxySwarm {
       const requestConfig: RequestInit = {
         method: "GET",
         headers: this.defaultHeaders,
-        dispatcher: proxy.agent as unknown as ProxyAgent,
+        dispatcher: proxy.agent,
         signal: controller.signal,
       };
 
@@ -252,9 +250,20 @@ class ProxySwarm {
   }
 
   private async cleanup(): Promise<void> {
-    this.log("Cleaning up...");
-    for (const provider of this.providers) {
-      await provider.stop();
+    if (this.proxies.length) {
+      this.log("Closing proxies agents");
+      for (const proxy of this.proxies) {
+        try {
+          await proxy.agent.close();
+        }
+        catch {}
+      }
+    }
+    if (this.providers.length && this.config.shutdownBehavior === "terminate") {
+      this.log("Terminating provider instances");
+      for (const provider of this.providers) {
+        await provider.terminate();
+      }
     }
     process.exit(0);
   }

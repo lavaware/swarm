@@ -5,7 +5,7 @@ import Swarm from "./swarm";
 
 const awsProvider = new AwsProxyProvider(
   {
-    proxyPort: 8001,
+    proxyPort: 8081,
     proxyUsername: "username",
     proxyPassword: "password",
     credentials: {

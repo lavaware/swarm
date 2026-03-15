@@ -46,6 +46,7 @@ export class AwsProxyProvider extends ProxyProvider {
       instanceName: "proxy",
       securityGroupName: "proxy-swarm",
       pingIntervalMs: 2000,
+      includeExisting: true,
       ...opts,
     };
     this.ec2Client = new ec2.EC2Client({
@@ -139,7 +140,7 @@ export class AwsProxyProvider extends ProxyProvider {
    * Check if key pair exists and create it if it doesn't
    */
   private async ensureKeyPair(): Promise<void> {
-    this.log(`Ensuring key pair "${this.config.keyName}" exists...`);
+    this.log(`Ensuring key pair "${this.config.keyName}" exists`);
     try {
       const describeCommand = new ec2.DescribeKeyPairsCommand({
         KeyNames: [this.config.keyName],
@@ -150,12 +151,8 @@ export class AwsProxyProvider extends ProxyProvider {
         return;
       }
       catch (error) {
-        if (error instanceof Error && error.message.includes("InvalidKeyPair.NotFound")) {
-          this.log(`Creating key pair "${this.config.keyName}"...`);
-        }
-        else {
+        if ((error as any).Code !== "InvalidKeyPair.NotFound") {
           this.error("Error describing key pair:", error);
-          throw error;
         }
       }
 
@@ -168,7 +165,6 @@ export class AwsProxyProvider extends ProxyProvider {
       execSync(`ssh-keygen -t ed25519 -f ${keyPath} -N "" -q`);
 
       const publicKeyPath = `${keyPath}.pub`;
-      const privateKeyPath = `${keyPath}.pem`;
       const publicKeyBuffer = Buffer.from(fs.readFileSync(publicKeyPath, "utf8"));
       const createCommand = new ec2.ImportKeyPairCommand({
         KeyName: this.config.keyName,
@@ -176,7 +172,7 @@ export class AwsProxyProvider extends ProxyProvider {
       });
 
       await this.ec2Client.send(createCommand);
-      fs.chmodSync(privateKeyPath, 0o600);
+      fs.chmodSync(keyPath, 0o600);
       this.log(`Created key pair "${this.config.keyName}" in ${keyDir}`);
     }
     catch (error) {
@@ -190,7 +186,7 @@ export class AwsProxyProvider extends ProxyProvider {
    * @returns The security group ID
    */
   private async ensureSecurityGroup(): Promise<string> {
-    this.log(`Ensuring security group "${this.config.securityGroupName}" exists...`);
+    this.log(`Ensuring security group "${this.config.securityGroupName}" exists`);
     try {
       // Check if security group exists
       const describeCommand = new ec2.DescribeSecurityGroupsCommand({
@@ -205,7 +201,7 @@ export class AwsProxyProvider extends ProxyProvider {
       }
       catch (error) {
         if (error instanceof Error && error.message.includes("InvalidGroup.NotFound")) {
-          this.log(`Creating security group "${this.config.securityGroupName}"...`);
+          this.log(`Creating security group "${this.config.securityGroupName}"`);
         }
         else {
           this.error("Error describing security group:", error);
@@ -256,24 +252,49 @@ export class AwsProxyProvider extends ProxyProvider {
    * @param instanceIds Array of instance IDs to wait for
    */
   private async waitForInstancesRunning(instanceIds: string[]): Promise<string[]> {
-    const publicIps = new Set<string>();
+    let totalInstances = instanceIds.length;
 
-    while (true) {
+    if (this.config.includeExisting) {
       const describeCommand = new ec2.DescribeInstancesCommand({
         Filters: [
           {
-            Name: "instance-id",
-            Values: instanceIds,
+            Name: "tag:Name",
+            Values: [this.config.instanceName],
           },
           {
             Name: "instance-state-name",
-            Values: ["running"],
+            Values: ["running", "pending"],
           },
         ],
       });
-
       const response = await this.ec2Client.send(describeCommand);
-      response.Reservations?.forEach((reservation: ec2.Reservation) => {
+      if (response.Reservations) {
+        totalInstances = response.Reservations.reduce((acc, reservation) => acc + (reservation.Instances?.length ?? 0), 0);
+      }
+    }
+
+    const publicIps = new Set<string>();
+
+    while (true) {
+      const filters = [{
+        Name: "instance-state-name",
+        Values: ["running"],
+      }];
+      if (this.config.includeExisting) {
+        filters.push({
+          Name: "tag:Name",
+          Values: [this.config.instanceName],
+        });
+      }
+      else {
+        filters.push({
+          Name: "instance-id",
+          Values: instanceIds,
+        });
+      }
+      const describeCommand = new ec2.DescribeInstancesCommand({ Filters: filters });
+      const describeResponse = await this.ec2Client.send(describeCommand);
+      describeResponse.Reservations?.forEach((reservation: ec2.Reservation) => {
         reservation.Instances?.forEach((instance: ec2.Instance) => {
           if (instance.PublicIpAddress) {
             publicIps.add(instance.PublicIpAddress);
@@ -281,10 +302,12 @@ export class AwsProxyProvider extends ProxyProvider {
         });
       });
 
-      this.log(`Waiting for public IPs (${publicIps.size}/${instanceIds.length})`);
+      this.log(`Waiting for public IPs (${publicIps.size}/${totalInstances})`);
 
-      if (publicIps.size === instanceIds.length) {
-        return [...publicIps];
+      if (publicIps.size === totalInstances) {
+        const ipArr = [...publicIps];
+        this.log(`All instances running: ${ipArr.join(", ").blue}`);
+        return ipArr;
       }
 
       await sleep(this.config.pingIntervalMs);
@@ -294,8 +317,7 @@ export class AwsProxyProvider extends ProxyProvider {
   /**
    * Terminate all proxy instances
    */
-  async stop(): Promise<void> {
-    this.log(`Terminating all proxy instances...`);
+  async terminate(): Promise<void> {
     try {
       const describeCommand = new ec2.DescribeInstancesCommand({
         Filters: [
@@ -322,9 +344,10 @@ export class AwsProxyProvider extends ProxyProvider {
       });
 
       if (instanceIds.length === 0) {
-        this.log(`No instances found with name "${this.config.instanceName}"`);
         return;
       }
+
+      this.log(`Terminating all instances (${instanceIds.length})`);
 
       const terminateCommand = new ec2.TerminateInstancesCommand({
         InstanceIds: instanceIds,
