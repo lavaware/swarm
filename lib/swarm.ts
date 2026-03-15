@@ -2,7 +2,6 @@ import type { HeadersInit, RequestInit } from "undici";
 import type { ProxyConfig, ProxyProvider } from "./provider";
 import process from "node:process";
 import { fetch, ProxyAgent } from "undici";
-import { Timer } from "./timer";
 import { sleep } from "./util";
 import "colors";
 
@@ -166,8 +165,8 @@ class ProxySwarm {
 
   async run(
     urls: string[],
-    handler: (proxy: Proxy, url: string, res: Response) => Promise<void> | void,
-    errorHandler: (proxy: Proxy, url: string, error: unknown) => Promise<void> | void,
+    handler: (res: Response, proxy?: Proxy, url?: string) => Promise<void> | void,
+    errorHandler?: (error: unknown, proxy?: Proxy, url?: string) => Promise<void> | void,
   ): Promise<void> {
     if (!this.proxies.length) {
       await sleep(this.config.pingIntervalMs);
@@ -184,24 +183,23 @@ class ProxySwarm {
 
     this.urlQueue.push(...urls);
 
-    const timer = new Timer({
-      alpha: 0.18,
-      ema: 0,
-      startTime: Date.now(),
-      totalItems: urls.length,
-      itemsProcessed: 0,
-    });
+    // const timer = new Timer({
+    //   alpha: 0.18,
+    //   ema: 0,
+    //   startTime: Date.now(),
+    //   totalItems: urls.length,
+    //   itemsProcessed: 0,
+    // });
 
-    const workers = this.proxies.map(proxy => this.runWorker(proxy, handler, errorHandler, timer));
+    const workers = this.proxies.map(proxy => this.runWorker(proxy, handler, errorHandler));
     await Promise.all(workers);
     this.log("All workers done");
   }
 
   async runWorker(
     proxy: Proxy,
-    handler: (proxy: Proxy, url: string, res: Response) => Promise<void> | void,
-    errorHandler: (proxy: Proxy, url: string, error: unknown) => Promise<void> | void,
-    timer: Timer,
+    handler: (res: Response, proxy?: Proxy, url?: string) => Promise<void> | void,
+    errorHandler?: (error: unknown, proxy?: Proxy, url?: string) => Promise<void> | void,
   ): Promise<void> {
     while (true) {
       const url = this.urlQueue[this.currentIndex++];
@@ -209,7 +207,6 @@ class ProxySwarm {
         break;
       }
 
-      const startTime = Date.now();
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), this.config.proxyTimeoutMs);
       const requestConfig: RequestInit = {
@@ -220,13 +217,14 @@ class ProxySwarm {
       };
 
       try {
+        this.log(`GET ${url} (${proxy.host})`);
         const res = await fetch(url, requestConfig);
-        await handler(proxy, url, res);
-        this.logInfo(true, proxy, url, startTime, timer);
+        await handler(res, proxy, url);
+        // this.logInfo(true, proxy, url, startTime, timer);
       }
       catch (error) {
-        await errorHandler(proxy, url, error);
-        this.logInfo(false, proxy, url, startTime, timer);
+        await errorHandler?.(error, proxy, url);
+        // this.logInfo(false, proxy, url, startTime, timer);
       }
       finally {
         clearTimeout(timeout);
@@ -234,20 +232,20 @@ class ProxySwarm {
     }
   }
 
-  private logInfo(
-    success: boolean,
-    proxy: Proxy,
-    url: string,
-    startTime: number,
-    timer: Timer,
-  ): void {
-    const { elapsed, eta, remaining } = timer.tick(startTime, this.proxies.length);
-    const trimmedUrl = url.length > 44 ? `${url.slice(0, 44)}...` : url;
-    const infoStr = [trimmedUrl.padEnd(48, " "), elapsed, eta, remaining, proxy.host].join(
-      " | ",
-    );
-    this.log(success ? infoStr : infoStr.red);
-  }
+  // private logInfo(
+  //   success: boolean,
+  //   proxy: Proxy,
+  //   url: string,
+  //   startTime: number,
+  //   timer: Timer,
+  // ): void {
+  //   const { elapsed, eta, remaining } = timer.tick(startTime, this.proxies.length);
+  //   const trimmedUrl = url.length > 44 ? `${url.slice(0, 44)}...` : url;
+  //   const infoStr = [trimmedUrl.padEnd(48, " "), elapsed, eta, remaining, proxy.host].join(
+  //     " | ",
+  //   );
+  //   this.log(success ? infoStr : infoStr.red);
+  // }
 
   private async cleanup(): Promise<void> {
     if (this.proxies.length) {
