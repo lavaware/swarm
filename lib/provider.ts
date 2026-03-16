@@ -2,12 +2,14 @@ export interface ProxyProviderOpts {
   proxyPort: number;
   proxyUsername: string;
   proxyPassword: string;
+  name?: string;
   instanceCount?: number;
   pingIntervalMs?: number;
   includeExisting?: boolean;
 }
 
 export interface ProxyProviderConfig {
+  name: string;
   proxyPort: number;
   proxyUsername: string;
   proxyPassword: string;
@@ -36,5 +38,5 @@ export abstract class ProxyProvider {
     ].join("\n");
   }
   abstract start({ onReady }: { onReady?: (config: ProxyConfig) => void }): Promise<void>;
-  abstract terminate(): Promise<void>;
+  abstract terminate(waitForTerminated?: boolean): Promise<this>;
 }

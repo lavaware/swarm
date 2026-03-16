@@ -28,6 +28,7 @@ interface SwarmOpts {
   pingIntervalMs?: number;
   pingTimeoutMs?: number;
   proxyTimeoutMs?: number;
+  startupBehavior?: "terminate";
   shutdownBehavior?: "terminate";
 }
 
@@ -39,6 +40,7 @@ interface SwarmConfig {
   pingIntervalMs: number;
   pingTimeoutMs: number;
   proxyTimeoutMs: number;
+  startupBehavior: "terminate" | null;
   shutdownBehavior: "terminate" | null;
 }
 
@@ -73,6 +75,7 @@ class ProxySwarm {
       pingIntervalMs: 5000,
       pingTimeoutMs: 15000,
       proxyTimeoutMs: 15000,
+      startupBehavior: null,
       shutdownBehavior: null,
       ...opts,
     };
@@ -102,15 +105,18 @@ class ProxySwarm {
       }
     }
     if (providers) {
-      for (const provider of providers) {
-        this.providers.push(provider);
-        provider.start({
-          onReady: (config) => {
-            const proxy = new Proxy(config);
-            this.proxies.push(proxy);
-          },
-        });
-      }
+      this.providers = providers;
+      const onReady = (config: ProxyConfig) => {
+        const proxy = new Proxy(config);
+        this.proxies.push(proxy);
+      };
+      const startupBehavior = this.config.startupBehavior;
+      (async () => {
+        if (startupBehavior === "terminate") {
+          await Promise.all(providers.map(p => p.terminate(true)));
+        }
+        await Promise.all(providers.map(p => p.start({ onReady })));
+      })();
     }
 
     const infoStr = [
@@ -163,42 +169,62 @@ class ProxySwarm {
     }
   }
 
-  async run(
-    urls: string[],
-    handler: (res: Response, proxy?: Proxy, url?: string) => Promise<void> | void,
-    errorHandler?: (error: unknown, proxy?: Proxy, url?: string) => Promise<void> | void,
-  ): Promise<void> {
+  async waitForProxiesReady(): Promise<void> {
     if (!this.proxies.length) {
       await sleep(this.config.pingIntervalMs);
-      return this.run(urls, handler, errorHandler);
+      await this.waitForProxiesReady();
     }
     if (this.config.waitForProxiesReady && this.runningProxies.size !== this.proxies.length) {
       this.log(`Waiting for proxies to be ready (${this.runningProxies.size}/${this.proxies.length})`);
       await sleep(this.config.pingIntervalMs);
-      return this.run(urls, handler, errorHandler);
+      await this.waitForProxiesReady();
     }
+  }
 
-    this.log(`All proxies ready`);
+  async get(url: string) {
+    await this.waitForProxiesReady();
+
+    const proxy = this.proxies[Math.floor(Math.random() * this.proxies.length)]; // stupid load balancing
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.config.proxyTimeoutMs);
+    const requestConfig: RequestInit = {
+      method: "GET",
+      headers: this.defaultHeaders,
+      dispatcher: proxy.agent,
+      signal: controller.signal,
+    };
+
+    try {
+      const shortUrl = url.length > 50 ? `${url.slice(0, 40)}...` : url;
+      this.log(`GET ${shortUrl} (${proxy.host})`);
+      const res = await fetch(url, requestConfig);
+      return res;
+    }
+    catch (error) {
+      this.error(`Unhandled error fetching ${url} (${proxy.host}):`, error);
+    }
+    finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async batch(
+    urls: string[],
+    handler: (res: Response, proxy?: Proxy, url?: string) => Promise<void> | void,
+    errorHandler?: (error: unknown, proxy?: Proxy, url?: string) => Promise<void> | void,
+  ): Promise<void> {
+    await this.waitForProxiesReady();
+
     this.log(`Running ${urls.length} URLs`);
 
     this.urlQueue.push(...urls);
-
-    // const timer = new Timer({
-    //   alpha: 0.18,
-    //   ema: 0,
-    //   startTime: Date.now(),
-    //   totalItems: urls.length,
-    //   itemsProcessed: 0,
-    // });
-
     const workers = this.proxies.map(proxy => this.runWorker(proxy, handler, errorHandler));
     await Promise.all(workers);
-    this.log("All workers done");
   }
 
   async runWorker(
     proxy: Proxy,
-    handler: (res: Response, proxy?: Proxy, url?: string) => Promise<void> | void,
+    handler?: (res: Response, proxy?: Proxy, url?: string) => Promise<void> | void,
     errorHandler?: (error: unknown, proxy?: Proxy, url?: string) => Promise<void> | void,
   ): Promise<void> {
     while (true) {
@@ -219,12 +245,17 @@ class ProxySwarm {
       try {
         this.log(`GET ${url} (${proxy.host})`);
         const res = await fetch(url, requestConfig);
-        await handler(res, proxy, url);
-        // this.logInfo(true, proxy, url, startTime, timer);
+        if (handler) {
+          await handler(res, proxy, url);
+        }
       }
       catch (error) {
-        await errorHandler?.(error, proxy, url);
-        // this.logInfo(false, proxy, url, startTime, timer);
+        if (errorHandler) {
+          await errorHandler(error, proxy, url);
+        }
+        else {
+          this.error(`Unhandled error fetching ${url} (${proxy.host}):`, error);
+        }
       }
       finally {
         clearTimeout(timeout);
@@ -232,24 +263,9 @@ class ProxySwarm {
     }
   }
 
-  // private logInfo(
-  //   success: boolean,
-  //   proxy: Proxy,
-  //   url: string,
-  //   startTime: number,
-  //   timer: Timer,
-  // ): void {
-  //   const { elapsed, eta, remaining } = timer.tick(startTime, this.proxies.length);
-  //   const trimmedUrl = url.length > 44 ? `${url.slice(0, 44)}...` : url;
-  //   const infoStr = [trimmedUrl.padEnd(48, " "), elapsed, eta, remaining, proxy.host].join(
-  //     " | ",
-  //   );
-  //   this.log(success ? infoStr : infoStr.red);
-  // }
-
   private async cleanup(): Promise<void> {
     if (this.proxies.length) {
-      this.log("Closing proxies agents");
+      this.log("Closing proxy connections");
       for (const proxy of this.proxies) {
         try {
           await proxy.agent.close();

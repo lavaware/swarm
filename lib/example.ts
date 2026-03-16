@@ -36,4 +36,4 @@ function onError(proxy: Proxy, url: string, error: unknown) {
   console.error(error);
 }
 
-await swarm.run(urls, onSuccess, onError);
+await swarm.batch(urls, onSuccess, onError);

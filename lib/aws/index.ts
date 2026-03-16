@@ -40,6 +40,7 @@ export class AwsProxyProvider extends ProxyProvider {
   constructor({ credentials, ...opts }: AwsProxyProviderOpts) {
     super();
     this.config = {
+      name: `AWS:${opts.region ?? "us-east-1"}`,
       region: "us-east-1",
       keyName: "proxy-swarm",
       instanceType: "t2.micro",
@@ -65,13 +66,36 @@ export class AwsProxyProvider extends ProxyProvider {
    */
   async start({ onReady }: { onReady?: (config: ProxyConfig) => void }) {
     try {
-      const availableInstanceCount = await this.getAvailableInstanceCount();
-      if (!availableInstanceCount) {
-        throw new Error("No instance capacity available");
+      const activeInstances = await this.getActiveInstances();
+      const activeInstanceIds = activeInstances.map(instance => instance.InstanceId!);
+      const availableCount = await this.getInstanceCapacity();
+      const desiredCount = this.config.instanceCount;
+      const activeCount = activeInstances.length;
+
+      if (desiredCount !== undefined) {
+        if (activeCount >= desiredCount) {
+          this.log(`Already running ${activeCount} instances`);
+          await this.waitForPublicIp(activeInstanceIds, onReady);
+          return;
+        }
+        if (availableCount + activeCount < desiredCount) {
+          this.error("Insufficient instance capacity");
+          return;
+        }
       }
-      const instanceCount = this.config.instanceCount
-        ? Math.min(this.config.instanceCount, availableInstanceCount)
-        : availableInstanceCount;
+      if (availableCount === 0) {
+        if (activeCount === 0) {
+          this.error("No instances available");
+          return;
+        }
+        else {
+          this.log(`Already running ${activeCount} instances`);
+          await this.waitForPublicIp(activeInstanceIds, onReady);
+          return;
+        }
+      }
+
+      const instanceCount = desiredCount ? Math.max(0, desiredCount - activeCount) : availableCount;
       const amiId = await this.getLatestDebianAmiId();
       if (!amiId) {
         throw new Error("No Debian 13 AMI found");
@@ -83,6 +107,7 @@ export class AwsProxyProvider extends ProxyProvider {
       const startupScript = ProxyProvider.getStartupScript(this.config.proxyUsername, this.config.proxyPassword);
       const userData = Buffer.from(startupScript).toString("base64");
 
+      this.log(`Launching ${instanceCount} instances`);
       const command = new ec2.RunInstancesCommand({
         ImageId: amiId,
         MinCount: 1,
@@ -103,24 +128,13 @@ export class AwsProxyProvider extends ProxyProvider {
           },
         ],
       });
-
       const response = await this.ec2Client.send(command);
-      const instanceIds = response.Instances?.map(instance => instance.InstanceId).filter(Boolean) as string[];
-      if (!instanceIds) {
+      const launchedInstanceIds = response.Instances?.map(instance => instance.InstanceId).filter(Boolean) as string[];
+      if (!launchedInstanceIds) {
         throw new Error("No instances launched");
       }
-
-      this.log(`Launched ${instanceIds.length} instances: ${instanceIds.join(", ").blue}`);
-
-      const publicIps = await this.waitForInstancesRunning(instanceIds);
-      for (const ip of publicIps) {
-        onReady?.({
-          host: ip,
-          port: this.config.proxyPort,
-          username: this.config.proxyUsername,
-          password: this.config.proxyPassword,
-        });
-      }
+      this.log(`Launched ${launchedInstanceIds.length} instances: ${launchedInstanceIds.join(", ").blue}`);
+      await this.waitForPublicIp([...activeInstanceIds, ...launchedInstanceIds], onReady);
     }
     catch (error) {
       this.error("Error launching instances:", error as Error);
@@ -128,12 +142,36 @@ export class AwsProxyProvider extends ProxyProvider {
     }
   }
 
+  /**
+   * Get all running or pending instances.
+   * @returns Array of active instances
+   */
+  private async getActiveInstances(): Promise<ec2.Instance[]> {
+    const describeCommand = new ec2.DescribeInstancesCommand({
+      Filters: [
+        {
+          Name: "tag:Name",
+          Values: [this.config.instanceName],
+        },
+        {
+          Name: "instance-state-name",
+          Values: ["running", "pending"],
+        },
+      ],
+    });
+    const describeResponse = await this.ec2Client.send(describeCommand);
+    const instances = describeResponse.Reservations?.flatMap(reservation => reservation.Instances ?? []) ?? [];
+    return instances;
+  }
+
   private log(message: string, ...args: unknown[]): void {
-    console.log(`${"[AWS]".blue} ${message}`, ...args);
+    const name = `[${this.config.name}]`.blue;
+    console.log(`${name} ${message}`, ...args);
   }
 
   private error(message: string, ...args: unknown[]): void {
-    console.error(`[AWS] ${message}`.red, ...args);
+    const name = `[${this.config.name}]`.red;
+    console.error(`${name} ${message}`, ...args);
   }
 
   /**
@@ -160,9 +198,10 @@ export class AwsProxyProvider extends ProxyProvider {
       await mkdir(keyDir, { recursive: true });
 
       const keyPath = path.resolve(keyDir, this.config.keyName);
-      const { execSync } = await import("node:child_process");
-
-      execSync(`ssh-keygen -t ed25519 -f ${keyPath} -N "" -q`);
+      if (!fs.existsSync(keyPath)) {
+        const { execSync } = await import("node:child_process");
+        execSync(`ssh-keygen -t ed25519 -f ${keyPath} -N "" -q`);
+      }
 
       const publicKeyPath = `${keyPath}.pub`;
       const publicKeyBuffer = Buffer.from(fs.readFileSync(publicKeyPath, "utf8"));
@@ -248,76 +287,47 @@ export class AwsProxyProvider extends ProxyProvider {
   }
 
   /**
-   * Wait for instances to be running
+   * Wait for instances to have a public IP
    * @param instanceIds Array of instance IDs to wait for
    */
-  private async waitForInstancesRunning(instanceIds: string[]): Promise<string[]> {
-    let totalInstances = instanceIds.length;
-
-    if (this.config.includeExisting) {
-      const describeCommand = new ec2.DescribeInstancesCommand({
-        Filters: [
-          {
-            Name: "tag:Name",
-            Values: [this.config.instanceName],
-          },
-          {
-            Name: "instance-state-name",
-            Values: ["running", "pending"],
-          },
-        ],
-      });
-      const response = await this.ec2Client.send(describeCommand);
-      if (response.Reservations) {
-        totalInstances = response.Reservations.reduce((acc, reservation) => acc + (reservation.Instances?.length ?? 0), 0);
-      }
-    }
-
-    const publicIps = new Set<string>();
+  private async waitForPublicIp(
+    instanceIds: string[],
+    onReady?: (config: ProxyConfig) => void,
+  ): Promise<void> {
+    const instanceIps = new Set<string>();
 
     while (true) {
-      const filters = [{
-        Name: "instance-state-name",
-        Values: ["running"],
-      }];
-      if (this.config.includeExisting) {
-        filters.push({
-          Name: "tag:Name",
-          Values: [this.config.instanceName],
-        });
-      }
-      else {
-        filters.push({
-          Name: "instance-id",
-          Values: instanceIds,
-        });
-      }
-      const describeCommand = new ec2.DescribeInstancesCommand({ Filters: filters });
+      const describeCommand = new ec2.DescribeInstancesCommand({ InstanceIds: instanceIds });
       const describeResponse = await this.ec2Client.send(describeCommand);
       describeResponse.Reservations?.forEach((reservation: ec2.Reservation) => {
         reservation.Instances?.forEach((instance: ec2.Instance) => {
           if (instance.PublicIpAddress) {
-            publicIps.add(instance.PublicIpAddress);
+            instanceIps.add(instance.PublicIpAddress);
           }
         });
       });
-
-      this.log(`Waiting for public IPs (${publicIps.size}/${totalInstances})`);
-
-      if (publicIps.size === totalInstances) {
-        const ipArr = [...publicIps];
-        this.log(`All instances running: ${ipArr.join(", ").blue}`);
-        return ipArr;
+      if (instanceIps.size === instanceIds.length) {
+        break;
       }
-
+      this.log(`Waiting for public IPs (${instanceIps.size}/${instanceIds.length})`);
       await sleep(this.config.pingIntervalMs);
+    }
+
+    this.log(`All instances public: ${[...instanceIps].join(", ").blue}`);
+    for (const ip of instanceIps) {
+      onReady?.({
+        host: ip,
+        port: this.config.proxyPort,
+        username: this.config.proxyUsername,
+        password: this.config.proxyPassword,
+      });
     }
   }
 
   /**
    * Terminate all proxy instances
    */
-  async terminate(): Promise<void> {
+  async terminate(waitForTerminated = false): Promise<this> {
     try {
       const describeCommand = new ec2.DescribeInstancesCommand({
         Filters: [
@@ -344,17 +354,42 @@ export class AwsProxyProvider extends ProxyProvider {
       });
 
       if (instanceIds.length === 0) {
-        return;
+        return this;
       }
 
-      this.log(`Terminating all instances (${instanceIds.length})`);
+      if (!waitForTerminated) {
+        this.log(`Terminating all instances (${instanceIds.length})`);
+      }
 
       const terminateCommand = new ec2.TerminateInstancesCommand({
         InstanceIds: instanceIds,
       });
-
       await this.ec2Client.send(terminateCommand);
+
+      if (waitForTerminated) {
+        const confirmedTerminated = new Set<string>();
+        do {
+          const describeCommand = new ec2.DescribeInstancesCommand({
+            InstanceIds: instanceIds,
+          });
+          const describeResponse = await this.ec2Client.send(describeCommand);
+          describeResponse.Reservations?.forEach((reservation: ec2.Reservation) => {
+            reservation.Instances?.forEach((instance: ec2.Instance) => {
+              if (instance.State?.Name === "terminated" && instance.InstanceId) {
+                confirmedTerminated.add(instance.InstanceId);
+              }
+            });
+          });
+          if (confirmedTerminated.size !== instanceIds.length) {
+            await sleep(this.config.pingIntervalMs);
+          }
+          this.log(`Terminating instances (${confirmedTerminated.size}/${instanceIds.length})`);
+        } while (confirmedTerminated.size !== instanceIds.length);
+      }
+
       this.log(`Terminated instances: ${instanceIds.join(", ").red}`);
+
+      return this;
     }
     catch (error) {
       this.error("Error terminating instances:", error);
@@ -387,7 +422,7 @@ export class AwsProxyProvider extends ProxyProvider {
    * Get the maximum allowed running vCPUs for the AWS account
    * @returns The maximum number of running vCPUs allowed
    */
-  async getAvailableInstanceCount(): Promise<number> {
+  async getInstanceCapacity(): Promise<number> {
     const ON_DEMAND_QUOTA_CODE = "L-1216C47A";
 
     const describeInstanceTypesCommand = new ec2.DescribeInstanceTypesCommand({
