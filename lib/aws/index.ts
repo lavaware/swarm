@@ -37,6 +37,7 @@ export class AwsProxyProvider extends ProxyProvider {
   public config: AwsProxyProviderConfig;
   private ec2Client: ec2.EC2Client;
   private serviceQuotasClient: serviceQuotas.ServiceQuotasClient;
+  private isTerminating = false;
   constructor({ credentials, ...opts }: AwsProxyProviderOpts) {
     super();
     this.config = {
@@ -93,6 +94,10 @@ export class AwsProxyProvider extends ProxyProvider {
           await this.waitForPublicIp(activeInstanceIds, onReady);
           return;
         }
+      }
+
+      if (this.isTerminating) {
+        return;
       }
 
       const instanceCount = desiredCount ? Math.max(0, desiredCount - activeCount) : availableCount;
@@ -178,6 +183,9 @@ export class AwsProxyProvider extends ProxyProvider {
    * Check if key pair exists and create it if it doesn't
    */
   private async ensureKeyPair(): Promise<void> {
+    if (this.isTerminating) {
+      return;
+    }
     this.log(`Ensuring key pair "${this.config.keyName}" exists`);
     try {
       const describeCommand = new ec2.DescribeKeyPairsCommand({
@@ -224,7 +232,10 @@ export class AwsProxyProvider extends ProxyProvider {
    * Check if security group exists and create it if it doesn't
    * @returns The security group ID
    */
-  private async ensureSecurityGroup(): Promise<string> {
+  private async ensureSecurityGroup(): Promise<string | void> {
+    if (this.isTerminating) {
+      return;
+    }
     this.log(`Ensuring security group "${this.config.securityGroupName}" exists`);
     try {
       // Check if security group exists
@@ -297,6 +308,9 @@ export class AwsProxyProvider extends ProxyProvider {
     const instanceIps = new Set<string>();
 
     while (true) {
+      if (this.isTerminating) {
+        return;
+      }
       const describeCommand = new ec2.DescribeInstancesCommand({ InstanceIds: instanceIds });
       const describeResponse = await this.ec2Client.send(describeCommand);
       describeResponse.Reservations?.forEach((reservation: ec2.Reservation) => {
@@ -329,6 +343,7 @@ export class AwsProxyProvider extends ProxyProvider {
    */
   async terminate(waitForTerminated = false): Promise<this> {
     try {
+      this.isTerminating = true;
       const describeCommand = new ec2.DescribeInstancesCommand({
         Filters: [
           {
